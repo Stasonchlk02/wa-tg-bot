@@ -1,51 +1,37 @@
-# start.sh
 #!/bin/bash
-set -e
 
-echo "========================================="
-echo "🚀 Запуск WA-TG Bot"
-echo "========================================="
+echo "=== Запуск ==="
 
-# Запускаем WhatsApp Bridge в фоне
-echo "📱 Запускаю WhatsApp Bridge на порту ${WA_PORT:-3001}..."
+# Запускаем Node
 node wa_bridge.js &
 WA_PID=$!
+echo "WA Bridge PID: $WA_PID"
 
-# Ждём пока Node поднимется
-echo "⏳ Жду запуска WA Bridge..."
-sleep 8
+sleep 6
 
-# Проверяем что bridge жив
+# Проверяем жив ли node
 if ! kill -0 $WA_PID 2>/dev/null; then
-    echo "❌ WA Bridge не запустился!"
+    echo "ОШИБКА: WA Bridge упал"
     exit 1
 fi
 
-echo "✅ WA Bridge запущен (PID: $WA_PID)"
-
-# Запускаем Telegram бота
-echo "🤖 Запускаю Telegram бота..."
+# Запускаем Python
 python3 main.py &
 PY_PID=$!
+echo "Python Bot PID: $PY_PID"
 
 sleep 3
 
 if ! kill -0 $PY_PID 2>/dev/null; then
-    echo "❌ Telegram бот не запустился!"
+    echo "ОШИБКА: Python бот упал"
     kill $WA_PID 2>/dev/null
     exit 1
 fi
 
-echo "========================================="
-echo "✅ Всё запущено!"
-echo "   WA Bridge PID: $WA_PID"
-echo "   TG Bot PID:    $PY_PID"
-echo "========================================="
+echo "=== Всё запущено ==="
 
-# Ждём завершения любого процесса
+# Держим контейнер живым
 wait -n $WA_PID $PY_PID
-EXIT_CODE=$?
-
-echo "❌ Один из процессов упал (код: $EXIT_CODE)"
+echo "Один из процессов упал"
 kill $WA_PID $PY_PID 2>/dev/null
 exit 1
