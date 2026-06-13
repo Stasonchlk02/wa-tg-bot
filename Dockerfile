@@ -1,7 +1,6 @@
-# Dockerfile
 FROM python:3.11-slim
 
-# Устанавливаем Node.js 20 + git
+# Install Node.js 20 + git
 RUN apt-get update && apt-get install -y \
     curl \
     bash \
@@ -11,23 +10,23 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Проверяем версии
+# Verify versions
 RUN node --version && npm --version && python3 --version && git --version
 
 WORKDIR /app
 
-# Устанавливаем Node зависимости
+# Install Node dependencies
 COPY package.json .
 RUN npm install
 
-# Устанавливаем Python зависимости
+# Install Python dependencies
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Копируем все файлы
+# Copy all files
 COPY . .
 
-# Делаем start.sh исполняемым
+# Make start.sh executable
 RUN chmod +x start.sh
 
 CMD ["bash", "start.sh"]
