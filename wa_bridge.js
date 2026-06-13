@@ -1,5 +1,9 @@
-import makeWASocket, { useMultiFileAuthState, DisconnectReason,
-    makeCacheableSignalKeyStore, fetchLatestBaileysVersion } from '@whiskeysockets/baileys'
+import makeWASocket, {
+    useMultiFileAuthState,
+    DisconnectReason,
+    makeCacheableSignalKeyStore,
+    fetchLatestBaileysVersion
+} from '@whiskeysockets/baileys'
 import express from 'express'
 import pino from 'pino'
 import fs from 'fs'
@@ -8,8 +12,8 @@ const logger = pino({ level: 'silent' })
 const app = express()
 app.use(express.json())
 
-const AUTH_DIR = './auth_info'
-const PORT = process.env.WA_PORT || 3001
+const AUTH_DIR = process.env.AUTH_DIR || '/tmp/wa_auth_info'
+const PORT = process.env.WA_PORT || process.env.PORT || 3001
 const PHONE_NUMBER = process.env.WA_PHONE || ''
 
 let sock = null
@@ -21,54 +25,32 @@ const MAX_RECONNECT = 5
 
 function normalizePhone(phone) {
     if (!phone) return ''
-    let p = phone.trim().replace(/\s/g, '')
-    if (!p.startsWith('+')) p = '+' + p
-    return p
+    // Оставляем только цифры
+    return phone.replace(/[^0-9]/g, '')
 }
 
 function ensureAuthDir() {
     if (!fs.existsSync(AUTH_DIR)) {
         fs.mkdirSync(AUTH_DIR, { recursive: true })
-        console.log('📁 Создана папка auth_info')
+        console.log(`✅ Создана папка ${AUTH_DIR}`)
     }
 }
 
-async function connectToWhatsApp() {
-    ensureAuthDir()
+function setupConnectionHandlers(socket, isMainConnection = false) {
+    socket.ev.on('connection.update', async (update) => {
+        console.log('🔔 connection.update:', JSON.stringify({
+            connection: update.connection,
+            statusCode: update.lastDisconnect?.error?.output?.statusCode,
+            hasPairingCode: !!update.pairingCode,
+        }))
 
-    const { version } = await fetchLatestBaileysVersion()
-    console.log(`📱 Используем WA версию: ${version}`)
-
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
-
-    // Создаём сокет — БЕЗ автоматического запроса pairing code
-    sock = makeWASocket({
-        version,
-        auth: {
-            creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, logger),
-        },
-        printQRInTerminal: false,
-        logger,
-        browser: ['WA Bridge', 'Chrome', '120.0.0'],
-        defaultQueryTimeoutMs: 10000,
-        generateHighQualityLinkPreview: false,
-        syncFullHistory: false,
-        markOnlineOnConnect: false,
-    })
-
-    sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, pairingCode: pc } = update
 
         if (pc) {
             pairingCode = pc
             connectionStatus = 'waiting_pair'
             console.log(`\n${'='.repeat(40)}`)
-            console.log(`📱 PAIRING CODE: ${pc}`)
-            console.log(`${'='.repeat(40)}`)
-            console.log('Откройте WhatsApp → Настройки → Связанные устройства')
-            console.log('→ Привязать устройство → Привязать по номеру телефона')
-            console.log(`→ Введите код: ${pc}`)
+            console.log(`🔐 PAIRING CODE: ${pc}`)
             console.log(`${'='.repeat(40)}\n`)
         }
 
@@ -78,6 +60,7 @@ async function connectToWhatsApp() {
             reconnectAttempts = 0
             pairingCode = null
             console.log('✅ WhatsApp подключён!')
+            console.log(`👤 ID: ${socket?.user?.id}`)
         }
 
         if (connection === 'close') {
@@ -89,163 +72,215 @@ async function connectToWhatsApp() {
 
             if (statusCode === DisconnectReason.loggedOut) {
                 console.log('🚪 Разлогинен. Удаляю сессию...')
-                try {
-                    fs.rmSync(AUTH_DIR, { recursive: true, force: true })
-                } catch (e) {
-                    console.log('Ошибка удаления auth_info:', e.message)
-                }
+                try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }) } catch {}
                 ensureAuthDir()
-                // После логаута НЕ переподключаемся автоматически
-                // Пользователь должен сам запросить pairing через бота
                 connectionStatus = 'logged_out'
-            } else if (reconnectAttempts < MAX_RECONNECT) {
+                // Не переподключаемся автоматически
+            } else if (isMainConnection && reconnectAttempts < MAX_RECONNECT) {
                 reconnectAttempts++
                 const delay = Math.min(reconnectAttempts * 5000, 30000)
-                console.log(`🔄 Переподключение через ${delay/1000}с (попытка ${reconnectAttempts}/${MAX_RECONNECT})`)
-                setTimeout(connectToWhatsApp, delay)
-            } else {
-                console.log('💀 Превышено число попыток')
-                connectionStatus = 'failed'
+                console.log(`🔄 Переподключение через ${delay/1000}с (${reconnectAttempts}/${MAX_RECONNECT})...`)
+                setTimeout(() => connectToWhatsApp(), delay)
+            } else if (!isMainConnection) {
+                // После pairing сокет перешёл в главный режим
+                setTimeout(() => connectToWhatsApp(), 3000)
             }
         }
     })
-
-    sock.ev.on('creds.update', saveCreds)
 }
 
-async function startBridge() {
+async function connectToWhatsApp() {
     ensureAuthDir()
-    console.log('⏳ Подключение...')
 
-    await connectToWhatsApp()
+    try {
+        const { version } = await fetchLatestBaileysVersion()
+        console.log(`📱 WA версия: ${version}`)
 
-    // ── REST API ──────────────────────────────────────────────────────────────
+        const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
 
-    app.get('/status', (req, res) => {
-        res.json({
-            connected: isConnected,
-            status: connectionStatus,
-            hasPairingCode: !!pairingCode,
-            pairingCode: pairingCode || null,
+        sock = makeWASocket({
+            version,
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, logger),
+            },
+            printQRInTerminal: false,
+            logger,
+            browser: ['WA Bridge', 'Chrome', '120.0.0'],
+            defaultQueryTimeoutMs: 15000,
+            generateHighQualityLinkPreview: false,
+            syncFullHistory: false,
+            markOnlineOnConnect: false,
+            connectTimeoutMs: 30000,
+            keepAliveIntervalMs: 25000,
         })
+
+        setupConnectionHandlers(sock, true)
+        sock.ev.on('creds.update', saveCreds)
+
+    } catch (error) {
+        console.error('❌ Ошибка connectToWhatsApp:', error.message)
+        if (reconnectAttempts < MAX_RECONNECT) {
+            reconnectAttempts++
+            setTimeout(() => connectToWhatsApp(), 10000)
+        }
+    }
+}
+
+// === HTTP API ===
+
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', connected: isConnected, connectionStatus })
+})
+
+app.get('/status', (req, res) => {
+    res.json({
+        connected: isConnected,
+        connectionStatus,
+        phone: sock?.user?.id ? sock.user.id.split(':')[0] : null,
+        pairingCode: pairingCode || null,
     })
+})
 
-    // Pairing запрашивается ТОЛЬКО вручную через этот endpoint
-    app.post('/pair', async (req, res) => {
-        const rawPhone = req.body.phone || PHONE_NUMBER
-        const phone = normalizePhone(rawPhone)
+app.post('/pair', async (req, res) => {
+    const { phone } = req.body
+    const targetPhone = phone || PHONE_NUMBER
 
-        if (!phone) {
-            return res.status(400).json({
-                success: false,
-                error: 'Номер не передан и WA_PHONE не задан'
-            })
-        }
-        if (!sock) {
-            return res.status(500).json({
-                success: false,
-                error: 'Socket не инициализирован'
-            })
-        }
-        if (isConnected) {
-            return res.status(400).json({
-                success: false,
-                error: 'WhatsApp уже подключён'
-            })
-        }
+    if (!targetPhone) {
+        return res.status(400).json({
+            error: 'Номер телефона не указан. Передайте phone или установите WA_PHONE.'
+        })
+    }
 
-        try {
-            console.log(`📲 Запрашиваю pairing code для ${phone}...`)
-            const code = await sock.requestPairingCode(phone)
-            pairingCode = code
-            connectionStatus = 'waiting_pair'
-            console.log(`📱 Pairing code для ${phone}: ${code}`)
-            res.json({ success: true, code, phone })
-        } catch (err) {
-            console.error('Ошибка pairing:', err.message)
-            res.status(500).json({ success: false, error: err.message })
-        }
-    })
+    if (isConnected) {
+        return res.json({ success: true, message: 'Уже подключён', alreadyConnected: true })
+    }
 
-    app.post('/send', async (req, res) => {
-        if (!isConnected) {
-            return res.status(503).json({ success: false, error: 'WhatsApp не подключён' })
-        }
-        const { phone, message } = req.body
-        if (!phone || !message) {
-            return res.status(400).json({ success: false, error: 'Нужны phone и message' })
-        }
-        try {
-            const digits = phone.replace(/\D/g, '')
-            const jid = `${digits}@s.whatsapp.net`
-            await sock.sendMessage(jid, { text: message })
-            res.json({ success: true })
-        } catch (err) {
-            console.error('Ошибка отправки:', err.message)
-            res.status(500).json({ success: false, error: err.message })
-        }
-    })
-
-    app.post('/send_bulk', async (req, res) => {
-        if (!isConnected) {
-            return res.status(503).json({ success: false, error: 'WhatsApp не подключён' })
-        }
-        const { phones, message, delay = 30 } = req.body
-        if (!phones || !message) {
-            return res.status(400).json({ success: false, error: 'Нужны phones и message' })
-        }
-
-        let sent = 0
-        const errors = []
-
-        for (let i = 0; i < phones.length; i++) {
-            const phone = phones[i]
-            try {
-                const digits = phone.replace(/\D/g, '')
-                const jid = `${digits}@s.whatsapp.net`
-                await sock.sendMessage(jid, { text: message })
-                sent++
-                console.log(`✅ [${i+1}/${phones.length}] Отправлено: ${phone}`)
-            } catch (err) {
-                console.error(`❌ Ошибка для ${phone}:`, err.message)
-                errors.push({ phone, error: err.message })
-            }
-            if (delay > 0 && i < phones.length - 1) {
-                await new Promise(r => setTimeout(r, delay * 1000))
-            }
-        }
-
-        res.json({ success: true, total: phones.length, sent, errors })
-    })
-
-    app.post('/logout', async (req, res) => {
-        try {
-            if (sock) await sock.logout()
-        } catch (e) {
-            console.log('Logout error (ignored):', e.message)
-        }
-
-        isConnected = false
-        connectionStatus = 'logged_out'
-        pairingCode = null
-
-        try {
-            fs.rmSync(AUTH_DIR, { recursive: true, force: true })
-        } catch (e) {
-            console.log('Ошибка удаления auth_info:', e.message)
+    try {
+        // Закрываем старый сокет
+        if (sock) {
+            try { sock.end(undefined) } catch {}
+            sock = null
+            isConnected = false
+            await new Promise(resolve => setTimeout(resolve, 2000))
         }
 
         ensureAuthDir()
+        const { version } = await fetchLatestBaileysVersion()
+        const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
+
+        const newSock = makeWASocket({
+            version,
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, logger),
+            },
+            printQRInTerminal: false,
+            logger,
+            browser: ['WA Bridge', 'Chrome', '120.0.0'],
+            defaultQueryTimeoutMs: 15000,
+            generateHighQualityLinkPreview: false,
+            syncFullHistory: false,
+            markOnlineOnConnect: false,
+        })
+
+        newSock.ev.on('creds.update', saveCreds)
+
+        // Ждём инициализации
+        await new Promise(resolve => setTimeout(resolve, 3000))
+
+        // Только цифры без +
+        const cleanPhone = normalizePhone(targetPhone)
+        console.log(`📲 Запрашиваю pairing code для +${cleanPhone}...`)
+
+        const code = await newSock.requestPairingCode(cleanPhone)
+        pairingCode = code
+        connectionStatus = 'waiting_pair'
+        console.log(`📱 Pairing code для +${cleanPhone}: ${code}`)
+
+        sock = newSock
+        setupConnectionHandlers(sock, false)
+
+        res.json({ success: true, pairingCode: code })
+
+    } catch (error) {
+        console.error('❌ Pairing error:', error.message)
+        console.error(error.stack)
+        res.status(500).json({ error: error.message })
+    }
+})
+
+app.post('/logout', async (req, res) => {
+    try {
+        if (sock) {
+            try { sock.end(undefined) } catch {}
+            sock = null
+        }
+        if (fs.existsSync(AUTH_DIR)) {
+            fs.rmSync(AUTH_DIR, { recursive: true, force: true })
+        }
+        isConnected = false
+        connectionStatus = 'logged_out'
+        pairingCode = null
+        ensureAuthDir()
         res.json({ success: true })
+    } catch (error) {
+        res.status(500).json({ error: error.message })
+    }
+})
 
-        // Переподключаемся чтобы сокет был готов к новому pairing
-        reconnectAttempts = 0
-        setTimeout(connectToWhatsApp, 2000)
-    })
+app.post('/send', async (req, res) => {
+    const { phone, message } = req.body
+    if (!phone || !message) {
+        return res.status(400).json({ error: 'phone и message обязательны' })
+    }
+    if (!sock || !isConnected) {
+        return res.status(503).json({ error: 'WhatsApp не подключён', status: connectionStatus })
+    }
+    try {
+        const jid = '+' + normalizePhone(phone) + '@s.whatsapp.net'
+        await sock.sendMessage(jid, { text: message })
+        res.json({ success: true, to: phone })
+    } catch (error) {
+        console.error('Send error:', error.message)
+        res.status(500).json({ error: error.message })
+    }
+})
 
-    app.listen(PORT, () => {
-        console.log(`🌐 WA Bridge API запущен на порту ${PORT}`)
-    })
-}
+app.post('/send_bulk', async (req, res) => {
+    const { phones, message, delay = 30 } = req.body
+    if (!phones?.length || !message) {
+        return res.status(400).json({ error: 'phones[] и message обязательны' })
+    }
+    if (!sock || !isConnected) {
+        return res.status(503).json({ error: 'WhatsApp не подключён', status: connectionStatus })
+    }
 
-startBridge().catch(console.error)
+    const results = { success: true, sent: [], failed: [], total: phones.length }
+    const startTime = Date.now()
+
+    for (let i = 0; i < phones.length; i++) {
+        const phone = phones[i]
+        try {
+            const jid = '+' + normalizePhone(phone) + '@s.whatsapp.net'
+            await sock.sendMessage(jid, { text: message })
+            results.sent.push(phone)
+            console.log(`✅ ${i + 1}/${phones.length}: ${phone}`)
+        } catch (error) {
+            console.error(`❌ ${phone}:`, error.message)
+            results.failed.push({ phone, error: error.message })
+        }
+        if (i < phones.length - 1 && delay > 0) {
+            await new Promise(resolve => setTimeout(resolve, delay * 1000))
+        }
+    }
+
+    results.elapsed_seconds = Math.round((Date.now() - startTime) / 1000)
+    res.json(results)
+})
+
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🌐 WA Bridge API запущен на порту ${PORT}`)
+})
+
+connectToWhatsApp().catch(console.error)
