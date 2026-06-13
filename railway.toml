@@ -1,8 +1,10 @@
-# railway.toml
 [build]
-builder = "DOCKERFILE"
-dockerfilePath = "Dockerfile"
+  builder = "DOCKERFILE"
 
 [deploy]
-restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 5
+  numReplicas = 1
+  startCommand = "bash start.sh"
+  healthcheckPath = "/status"
+  healthcheckTimeout = 100
+  restartPolicyType = "ON_FAILURE"
+  restartPolicyMaxRetries = 3
