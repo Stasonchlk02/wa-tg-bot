@@ -1,3 +1,4 @@
 python-telegram-bot==20.7
 requests==2.31.0
 pdfplumber==0.10.4
+psycopg2-binary==2.9.9
