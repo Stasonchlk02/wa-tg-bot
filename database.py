@@ -1,68 +1,108 @@
-import json
-import os
 import logging
+import os
+import psycopg2
+import psycopg2.extras
 from datetime import datetime
 from phone_record import PhoneRecord
 
 logger = logging.getLogger(__name__)
-DB_FILE = "phone_db.json"
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 
 class Database:
-    """Простая JSON-база данных для хранения номеров"""
-
     def __init__(self):
-        self.records: list[PhoneRecord] = []
-        self.broadcast_text: str = ""  # Текст рассылки по умолчанию
-        self.load()
+        self.broadcast_text: str = ""
+        self._init_db()
+        self._load_broadcast_text()
 
-    def load(self):
-        """Загрузить данные из файла"""
-        if not os.path.exists(DB_FILE):
-            return
-        try:
-            with open(DB_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                self.broadcast_text = data.get("broadcast_text", "")
-                for item in data.get("records", []):
-                    rec = PhoneRecord(
-                        phone=item["phone"],
-                        file_name=item.get("file_name", ""),
-                        sender_username=item.get("sender_username", ""),
-                        sender_first_name=item.get("sender_first_name", ""),
-                    )
-                    rec.sent = item.get("sent", False)
-                    rec.timestamp = datetime.fromisoformat(
-                        item.get("timestamp", datetime.now().isoformat())
-                    )
-                    self.records.append(rec)
-            logger.info(f"Загружено {len(self.records)} записей из БД")
-        except Exception as e:
-            logger.error(f"Ошибка загрузки БД: {e}")
+    # ─── Подключение ───────────────────────────────────────────────────────────
 
-    def save(self):
-        """Сохранить данные в файл"""
+    def _connect(self):
+        return psycopg2.connect(DATABASE_URL)
+
+    # ─── Инициализация таблиц ──────────────────────────────────────────────────
+
+    def _init_db(self):
+        """Создать таблицы если не существуют"""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                # Таблица номеров
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS phone_records (
+                        id SERIAL PRIMARY KEY,
+                        phone VARCHAR(20) UNIQUE NOT NULL,
+                        file_name TEXT,
+                        sender_username TEXT,
+                        sender_first_name TEXT,
+                        timestamp TIMESTAMP DEFAULT NOW(),
+                        sent BOOLEAN DEFAULT FALSE
+                    )
+                """)
+                # Таблица настроек
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    )
+                """)
+            conn.commit()
+        logger.info("БД инициализирована")
+
+    # ─── Настройки ─────────────────────────────────────────────────────────────
+
+    def _load_broadcast_text(self):
         try:
-            data = {
-                "broadcast_text": self.broadcast_text,
-                "records": [r.to_dict() for r in self.records],
-            }
-            with open(DB_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT value FROM settings WHERE key = 'broadcast_text'"
+                    )
+                    row = cur.fetchone()
+                    self.broadcast_text = row[0] if row else ""
         except Exception as e:
-            logger.error(f"Ошибка сохранения БД: {e}")
+            logger.error(f"Ошибка загрузки текста рассылки: {e}")
+            self.broadcast_text = ""
+
+    def set_broadcast_text(self, text: str):
+        self.broadcast_text = text
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO settings (key, value)
+                    VALUES ('broadcast_text', %s)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """, (text,))
+            conn.commit()
+
+    # ─── Записи ────────────────────────────────────────────────────────────────
 
     def add_record(self, record: PhoneRecord) -> bool:
-        """Добавить запись, вернуть True если новая"""
-        existing_phones = {r.phone for r in self.records}
-        if record.phone not in existing_phones:
-            self.records.append(record)
-            self.save()
-            return True
-        return False
+        """Добавить запись. Вернуть True если новая."""
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO phone_records
+                            (phone, file_name, sender_username, sender_first_name, timestamp, sent)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (phone) DO NOTHING
+                    """, (
+                        record.phone,
+                        record.file_name,
+                        record.sender_username,
+                        record.sender_first_name,
+                        record.timestamp,
+                        record.sent,
+                    ))
+                    inserted = cur.rowcount
+                conn.commit()
+            return inserted > 0
+        except Exception as e:
+            logger.error(f"Ошибка добавления записи: {e}")
+            return False
 
     def add_phone_manual(self, phone: str, added_by: str = "admin") -> bool:
-        """Ручное добавление номера"""
         rec = PhoneRecord(
             phone=phone,
             file_name="manual",
@@ -72,72 +112,106 @@ class Database:
         return self.add_record(rec)
 
     def get_all_phones(self) -> list[str]:
-        """Все уникальные номера"""
-        return list({r.phone for r in self.records})
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT phone FROM phone_records")
+                return [row[0] for row in cur.fetchall()]
 
     def get_unsent_phones(self) -> list[str]:
-        """Номера, которым ещё не отправляли"""
-        seen = set()
-        result = []
-        for r in self.records:
-            if not r.sent and r.phone not in seen:
-                seen.add(r.phone)
-                result.append(r.phone)
-        return result
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT phone FROM phone_records WHERE sent = FALSE"
+                )
+                return [row[0] for row in cur.fetchall()]
 
     def mark_sent(self, phones: list[str]):
-        """Пометить номера как отправленные"""
-        phone_set = set(phones)
-        for r in self.records:
-            if r.phone in phone_set:
-                r.sent = True
-        self.save()
+        if not phones:
+            return
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_batch(
+                    cur,
+                    "UPDATE phone_records SET sent = TRUE WHERE phone = %s",
+                    [(p,) for p in phones],
+                )
+            conn.commit()
 
     def mark_unsent(self, phones: list[str]):
-        """Сбросить статус отправки"""
-        phone_set = set(phones)
-        for r in self.records:
-            if r.phone in phone_set:
-                r.sent = False
-        self.save()
+        if not phones:
+            return
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_batch(
+                    cur,
+                    "UPDATE phone_records SET sent = FALSE WHERE phone = %s",
+                    [(p,) for p in phones],
+                )
+            conn.commit()
 
     def delete_phone(self, phone: str) -> bool:
-        """Удалить номер"""
-        before = len(self.records)
-        self.records = [r for r in self.records if r.phone != phone]
-        if len(self.records) < before:
-            self.save()
-            return True
-        return False
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM phone_records WHERE phone = %s", (phone,)
+                )
+                deleted = cur.rowcount
+            conn.commit()
+        return deleted > 0
 
     def clear_all(self):
-        """Очистить всё"""
-        self.records = []
-        self.save()
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM phone_records")
+            conn.commit()
 
     def get_stats(self) -> dict:
-        """Статистика"""
-        all_phones = self.get_all_phones()
-        unsent = self.get_unsent_phones()
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM phone_records")
+                total = cur.fetchone()[0]
+                cur.execute(
+                    "SELECT COUNT(*) FROM phone_records WHERE sent = TRUE"
+                )
+                sent = cur.fetchone()[0]
         return {
-            "total": len(all_phones),
-            "sent": len(all_phones) - len(unsent),
-            "unsent": len(unsent),
+            "total": total,
+            "sent": sent,
+            "unsent": total - sent,
         }
 
-    def set_broadcast_text(self, text: str):
-        """Установить текст рассылки"""
-        self.broadcast_text = text
-        self.save()
-
-    def get_records_page(self, page: int, per_page: int = 10) -> tuple[list, int]:
+    def get_records_page(self, page: int, per_page: int = 10):
         """Получить страницу записей"""
-        all_unique = {}
-        for r in self.records:
-            if r.phone not in all_unique:
-                all_unique[r.phone] = r
-        unique_list = list(all_unique.values())
-        total_pages = max(1, (len(unique_list) + per_page - 1) // per_page)
-        start = page * per_page
-        end = start + per_page
-        return unique_list[start:end], total_pages
+        offset = page * per_page
+        with self._connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM phone_records"
+                )
+                total = cur.fetchone()[0]
+                total_pages = max(1, (total + per_page - 1) // per_page)
+
+                cur.execute("""
+                    SELECT phone, file_name, sender_username,
+                           sender_first_name, timestamp, sent
+                    FROM phone_records
+                    ORDER BY timestamp DESC
+                    LIMIT %s OFFSET %s
+                """, (per_page, offset))
+
+                rows = cur.fetchall()
+
+        # Преобразуем в PhoneRecord
+        records = []
+        for row in rows:
+            rec = PhoneRecord(
+                phone=row["phone"],
+                file_name=row["file_name"] or "",
+                sender_username=row["sender_username"] or "",
+                sender_first_name=row["sender_first_name"] or "",
+            )
+            rec.sent = row["sent"]
+            rec.timestamp = row["timestamp"]
+            records.append(rec)
+
+        return records, total_pages
