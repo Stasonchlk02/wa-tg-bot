@@ -6,98 +6,68 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 WA_BRIDGE_URL = os.environ.get("WA_BRIDGE_URL", "http://localhost:3001")
+WA_PHONE = os.environ.get("WA_PHONE", "")
 
 
 class WhatsAppSender:
 
     @classmethod
-    def init(cls):
-        """Проверяем подключение к WA Bridge"""
+    def _request(cls, method: str, endpoint: str, json=None) -> dict:
+        url = f"{WA_BRIDGE_URL}{endpoint}"
         try:
-            resp = requests.get(f"{WA_BRIDGE_URL}/status", timeout=5)
-            data = resp.json()
-            logger.info(f"📱 WhatsApp Bridge статус: {data['status']}")
-
-            if data.get('pairing_code'):
-                logger.info(f"🔑 Pairing Code: {data['pairing_code']}")
-                logger.info("Введите этот код в WhatsApp на телефоне!")
-
-            if data['connected']:
-                logger.info("✅ WhatsApp подключён и готов")
+            if method == "get":
+                resp = requests.get(url, timeout=10)
+            elif method == "post":
+                resp = requests.post(url, json=json, timeout=60)
             else:
-                logger.warning("⚠️ WhatsApp не подключён. Используйте /wapair в боте")
+                return {"success": False, "error": "Unsupported method"}
 
+            if resp.status_code == 200:
+                data = resp.json()
+                return {"success": True, **data}
+            else:
+                return {
+                    "success": False,
+                    "error": f"HTTP {resp.status_code}: {resp.text[:200]}",
+                }
         except requests.exceptions.ConnectionError:
-            logger.error("❌ WA Bridge не запущен! Запустите: node wa_bridge.js")
-            raise
+            return {"success": False, "error": "WA Bridge недоступен"}
+        except requests.exceptions.Timeout:
+            return {"success": False, "error": "Таймаут запроса к WA Bridge"}
         except Exception as e:
-            logger.error(f"❌ Ошибка подключения к WA Bridge: {e}")
-            raise
+            logger.exception("WA Bridge request failed")
+            return {"success": False, "error": str(e)}
 
     @classmethod
     def get_status(cls) -> dict:
-        """Получить статус подключения"""
-        try:
-            resp = requests.get(f"{WA_BRIDGE_URL}/status", timeout=5)
-            return resp.json()
-        except Exception as e:
-            return {"connected": False, "status": "bridge_offline", "error": str(e)}
+        return cls._request("get", "/status")
 
     @classmethod
     def send_message(cls, phone: str, text: str) -> dict:
-        """Отправить сообщение"""
-        try:
-            resp = requests.post(
-                f"{WA_BRIDGE_URL}/send",
-                json={"phone": phone, "message": text},
-                timeout=30
-            )
-            result = resp.json()
-            if result.get("success"):
-                logger.info(f"✅ Отправлено → {phone}")
-            else:
-                logger.warning(f"❌ Не отправлено → {phone}: {result.get('error')}")
-            return result
-        except Exception as e:
-            logger.error(f"❌ Ошибка связи с WA Bridge: {e}")
-            return {"success": False, "error": str(e)}
+        return cls._request("post", "/send", json={"phone": phone, "message": text})
 
     @classmethod
     def send_bulk(cls, phones: list, text: str, delay: int = 30) -> dict:
-        """Массовая рассылка"""
-        try:
-            resp = requests.post(
-                f"{WA_BRIDGE_URL}/send_bulk",
-                json={"phones": phones, "message": text, "delay_seconds": delay},
-                timeout=10
-            )
-            return resp.json()
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return cls._request(
+            "post",
+            "/send_bulk",
+            json={"phones": phones, "message": text, "delay": delay},
+        )
 
     @classmethod
-    def pair(cls, phone: str) -> dict:
-        """Запросить pairing code"""
-        try:
-            resp = requests.post(
-                f"{WA_BRIDGE_URL}/pair",
-                json={"phone": phone},
-                timeout=15
-            )
-            return resp.json()
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+    def pair(cls, phone: str = "") -> dict:
+        """
+        Запросить pairing code.
+        Если phone не передан — берём из переменной окружения WA_PHONE.
+        """
+        target_phone = phone or WA_PHONE
+        if not target_phone:
+            return {
+                "success": False,
+                "error": "Номер телефона не задан. Установите WA_PHONE в переменных окружения.",
+            }
+        return cls._request("post", "/pair", json={"phone": target_phone})
 
     @classmethod
     def logout(cls) -> dict:
-        """Выйти из WhatsApp"""
-        try:
-            resp = requests.post(f"{WA_BRIDGE_URL}/logout", timeout=10)
-            return resp.json()
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-
-    @classmethod
-    def shutdown(cls):
-        """Ничего не нужно закрывать"""
-        pass
+        return cls._request("post", "/logout")
