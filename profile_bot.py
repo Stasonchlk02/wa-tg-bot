@@ -810,7 +810,11 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_handler))
 
     logger.info("Бот запущен")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+    drop_pending_updates=True,
+    allowed_updates=Update.ALL_TYPES,
+    close_loop=False,
+)
 
 
 if __name__ == "__main__":
