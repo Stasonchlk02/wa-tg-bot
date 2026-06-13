@@ -1,513 +1,816 @@
 import logging
 import os
 import re
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, filters, ContextTypes
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
 )
+
+from database import Database
 from pdf_phone_extractor import extract_phones_from_pdf
 from phone_record import PhoneRecord
 from whatsapp_sender import WhatsAppSender
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "ТВОЙ_ТОКЕН")
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "1636373767"))
 
-# Шаблоны приветственных сообщений
-DEFAULT_TEMPLATES = {
-    "greeting1": "Здравствуйте! Нашёл ваш контакт в профиле. Хотел бы обсудить возможное сотрудничество. Будет удобно пообщаться?",
-    "greeting2": "Добрый день! Меня зовут [Имя]. Увидел ваш профиль и хотел бы предложить сотрудничество. Когда будет удобно обсудить?",
-    "greeting3": "Привет! Нашёл ваш номер в каталоге. Есть интересное предложение — напишите, когда будет минутка."
-}
+# Глобальная база данных
+db = Database()
+
+# Паттерн для проверки номера
+PHONE_RE = re.compile(r"^\+7\d{10}$")
 
 
-class ProfileBot:
-    def __init__(self):
-        self.phone_records = []
-        self.selected_phone = None
-        self.user_mode = {}  # chat_id -> mode
-        self.pending_template = None
-        self.custom_templates = dict(DEFAULT_TEMPLATES)
-        self.daily_sent_count = 0
-        self.sent_log = []  # лог отправок
+# ─────────────────────────── Вспомогательные функции ───────────────────────────
 
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat_id = update.effective_chat.id
-        if chat_id != ADMIN_CHAT_ID:
-            await update.message.reply_text("❌ У вас нет доступа к этому боту.")
-            return
+def is_admin(update: Update) -> bool:
+    return update.effective_chat.id == ADMIN_CHAT_ID
 
-        status = WhatsAppSender.get_status()
-        wa_status = "✅ Подключён" if status.get("connected") else "❌ Не подключён"
 
-        if status.get("pairing_code"):
-            wa_status += f"\n🔑 Код привязки: `{status['pairing_code']}`"
+def admin_main_keyboard() -> InlineKeyboardMarkup:
+    """Главная клавиатура администратора"""
+    stats = db.get_stats()
+    buttons = [
+        [
+            InlineKeyboardButton(
+                f"📊 База: {stats['total']} | ✅ {stats['sent']} | ⏳ {stats['unsent']}",
+                callback_data="stats",
+            )
+        ],
+        [
+            InlineKeyboardButton("📨 Разослать новым", callback_data="broadcast_unsent"),
+            InlineKeyboardButton("📢 Разослать всем", callback_data="broadcast_all"),
+        ],
+        [
+            InlineKeyboardButton("✏️ Текст рассылки", callback_data="set_text"),
+            InlineKeyboardButton("👁 Текущий текст", callback_data="show_text"),
+        ],
+        [
+            InlineKeyboardButton("📋 Список номеров", callback_data="list_phones:0"),
+            InlineKeyboardButton("➕ Добавить номер", callback_data="add_phone"),
+        ],
+        [
+            InlineKeyboardButton("🔌 Статус WA", callback_data="wa_status"),
+            InlineKeyboardButton("📱 Пара WA", callback_data="wa_pair"),
+        ],
+        [
+            InlineKeyboardButton("🚪 Выйти WA", callback_data="wa_logout"),
+            InlineKeyboardButton("🗑 Очистить базу", callback_data="clear_confirm"),
+        ],
+    ]
+    return InlineKeyboardMarkup(buttons)
 
+
+def user_main_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура для обычного пользователя"""
+    buttons = [
+        [InlineKeyboardButton("📄 Отправить PDF", callback_data="hint_pdf")],
+        [InlineKeyboardButton("ℹ️ О боте", callback_data="about")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def back_keyboard(callback: str = "admin_menu") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("◀️ Назад", callback_data=callback)]]
+    )
+
+
+def phones_list_keyboard(page: int, total_pages: int) -> InlineKeyboardMarkup:
+    """Клавиатура пагинации для списка номеров"""
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"list_phones:{page - 1}"))
+    nav.append(
+        InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop")
+    )
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"list_phones:{page + 1}"))
+
+    buttons = [
+        nav,
+        [
+            InlineKeyboardButton("🔄 Сбросить статусы", callback_data="reset_sent"),
+            InlineKeyboardButton("❌ Удалить номер", callback_data="delete_phone_prompt"),
+        ],
+        [InlineKeyboardButton("◀️ Меню", callback_data="admin_menu")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+# ─────────────────────────── Команды ───────────────────────────
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Стартовое меню"""
+    context.user_data.clear()
+
+    if is_admin(update):
         await update.message.reply_text(
-            f"🤖 **Бот WhatsApp Рассылки**\n\n"
-            f"📱 WhatsApp: {wa_status}\n"
-            f"📊 Отправлено сегодня: {self.daily_sent_count}/40\n\n"
-            f"**Команды:**\n"
-            f"/pdf — загрузить PDF с номерами\n"
-            f"/numbers — список номеров\n"
-            f"/send — отправить одному номеру из списка\n"
-            f"/sendall — отправить всем из списка\n"
-            f"/sendmanual — отправить на любой номер\n"
-            f"/templates — шаблоны сообщений\n"
-            f"/wastatus — статус WhatsApp\n"
-            f"/wapair — привязать WhatsApp\n"
-            f"/walogout — отвязать WhatsApp\n"
-            f"/clear — очистить список номеров\n"
-            f"/log — лог отправок",
-            parse_mode="Markdown"
+            "👑 *Панель администратора*\n\n"
+            "Управляйте базой номеров и рассылкой через кнопки ниже.\n"
+            "Любой пользователь может присылать PDF — номера попадут в базу.",
+            parse_mode="Markdown",
+            reply_markup=admin_main_keyboard(),
+        )
+    else:
+        await update.message.reply_text(
+            "📱 *Бот для сбора номеров*\n\n"
+            "Отправьте PDF-файл — я извлеку из него номер телефона.\n"
+            "Можно также написать номер напрямую в формате +79XXXXXXXXX",
+            parse_mode="Markdown",
+            reply_markup=user_main_keyboard(),
         )
 
-    # ─── WhatsApp управление ───
 
-    async def wa_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat.id != ADMIN_CHAT_ID:
-            return
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /menu — только для админа"""
+    if not is_admin(update):
+        return
+    context.user_data.clear()
+    await update.message.reply_text(
+        "👑 *Панель администратора*",
+        parse_mode="Markdown",
+        reply_markup=admin_main_keyboard(),
+    )
 
-        status = WhatsAppSender.get_status()
 
-        text = f"📱 **Статус WhatsApp**\n\n"
-        text += f"Подключение: {'✅ Да' if status.get('connected') else '❌ Нет'}\n"
-        text += f"Статус: {status.get('status', 'unknown')}\n"
+# ─────────────────────────── Обработка файлов и номеров ───────────────────────
 
-        if status.get('pairing_code'):
-            text += f"\n🔑 **Код привязки:** `{status['pairing_code']}`\n"
-            text += f"Откройте WhatsApp → Настройки → Связанные устройства → Привязать по номеру"
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка любых документов от любого пользователя"""
+    doc = update.message.document
+    if not doc:
+        return
 
-        if status.get('error'):
-            text += f"\n⚠️ Ошибка: {status['error']}"
+    # Принимаем PDF и текстовые файлы со списками номеров
+    fname = doc.file_name.lower()
 
-        await update.message.reply_text(text, parse_mode="Markdown")
-
-    async def wa_pair(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat.id != ADMIN_CHAT_ID:
-            return
-
-        if not context.args:
-            await update.message.reply_text(
-                "📱 Использование: `/wapair 79XXXXXXXXX`\n"
-                "Укажите ваш номер WhatsApp без + и пробелов",
-                parse_mode="Markdown"
-            )
-            return
-
-        phone = context.args[0].strip()
-        phone = phone.replace('+', '').replace(' ', '').replace('-', '')
-
-        await update.message.reply_text(f"⏳ Запрашиваю код привязки для {phone}...")
-
-        result = WhatsAppSender.pair(phone)
-
-        if result.get('success'):
-            await update.message.reply_text(
-                f"✅ Запрос отправлен!\n\n"
-                f"Подождите 10 секунд и используйте /wastatus чтобы увидеть код.\n\n"
-                f"Затем откройте WhatsApp на телефоне:\n"
-                f"⚙️ Настройки → Связанные устройства → Привязать устройство → Привязать по номеру телефона"
-            )
-        else:
-            await update.message.reply_text(f"❌ Ошибка: {result.get('error')}")
-
-    async def wa_logout(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat.id != ADMIN_CHAT_ID:
-            return
-
-        result = WhatsAppSender.logout()
-        if result.get('success'):
-            await update.message.reply_text("✅ WhatsApp отключён")
-        else:
-            await update.message.reply_text(f"❌ Ошибка: {result.get('error')}")
-
-    # ─── Номера ───
-
-    async def numbers(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat.id != ADMIN_CHAT_ID:
-            return
-
-        if not self.phone_records:
-            await update.message.reply_text("📋 Список номеров пуст. Отправьте PDF файл.")
-            return
-
-        lines = [f"📋 **Список номеров ({len(self.phone_records)}):**\n"]
-        for i, record in enumerate(self.phone_records):
-            lines.append(f"{i+1}. `{record.phone}` — {record.file_name}")
-
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-    async def clear(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat.id != ADMIN_CHAT_ID:
-            return
-        count = len(self.phone_records)
-        self.phone_records.clear()
-        await update.message.reply_text(f"🗑 Удалено {count} номеров")
-
-    # ─── Шаблоны ───
-
-    async def templates(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat.id != ADMIN_CHAT_ID:
-            return
-
-        text = "📝 **Шаблоны сообщений:**\n\n"
-        keyboard = []
-
-        for key, tmpl in self.custom_templates.items():
-            text += f"**{key}:**\n{tmpl}\n\n"
-
-        text += "Чтобы добавить свой шаблон: `/addtemplate имя Текст сообщения`"
-
-        await update.message.reply_text(text, parse_mode="Markdown")
-
-    async def add_template(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat.id != ADMIN_CHAT_ID:
-            return
-
-        if not context.args or len(context.args) < 2:
-            await update.message.reply_text(
-                "Использование: `/addtemplate имя Текст шаблона`",
-                parse_mode="Markdown"
-            )
-            return
-
-        name = context.args[0]
-        text = ' '.join(context.args[1:])
-        self.custom_templates[name] = text
-        await update.message.reply_text(f"✅ Шаблон `{name}` сохранён", parse_mode="Markdown")
-
-    # ─── Отправка одному ───
-
-    async def send_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat.id != ADMIN_CHAT_ID:
-            return
-
-        if not self.phone_records:
-            await update.message.reply_text("❌ Список номеров пуст.")
-            return
-
-        keyboard = []
-        for record in self.phone_records[:20]:  # макс 20 кнопок
-            keyboard.append([InlineKeyboardButton(
-                record.phone, callback_data=f"pick_{record.phone}"
-            )])
-
+    if fname.endswith(".pdf"):
+        await _process_pdf(update, context, doc)
+    elif fname.endswith(".txt"):
+        await _process_txt(update, context, doc)
+    else:
         await update.message.reply_text(
-            "📱 Выберите номер:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            "❌ Поддерживаются только PDF и TXT файлы.\n"
+            "TXT — список номеров по одному на строку."
         )
 
-    async def send_manual(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat.id != ADMIN_CHAT_ID:
-            return
 
-        self.user_mode[ADMIN_CHAT_ID] = "manual_input"
-        await update.message.reply_text(
-            "✏️ Введите номер и текст через пробел:\n"
-            "`+79123456789 Привет, это тестовое сообщение`\n\n"
-            "Или номер и имя шаблона:\n"
-            "`+79123456789 #greeting1`",
-            parse_mode="Markdown"
-        )
+async def _process_pdf(update, context, doc):
+    """Извлечь номера из PDF"""
+    status_msg = await update.message.reply_text("⏳ Обрабатываю PDF...")
+    try:
+        file = await context.bot.get_file(doc.file_id)
+        file_path = f"/tmp/{doc.file_name}"
+        await file.download_to_drive(file_path)
+        phones = extract_phones_from_pdf(file_path)
+        os.remove(file_path)
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Ошибка обработки: {e}")
+        return
 
-    # ─── Рассылка всем ───
+    if not phones:
+        await status_msg.edit_text("📭 Номеров телефонов в PDF не найдено.")
+        return
 
-    async def send_all(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat.id != ADMIN_CHAT_ID:
-            return
+    await _save_phones(update, status_msg, phones, doc.file_name)
 
-        if not self.phone_records:
-            await update.message.reply_text("❌ Список пуст.")
-            return
 
-        # Показываем шаблоны для выбора
-        keyboard = []
-        for key in self.custom_templates:
-            keyboard.append([InlineKeyboardButton(
-                f"📝 {key}", callback_data=f"bulktpl_{key}"
-            )])
-        keyboard.append([InlineKeyboardButton(
-            "✏️ Свой текст", callback_data="bulktpl_custom"
-        )])
+async def _process_txt(update, context, doc):
+    """Извлечь номера из TXT"""
+    status_msg = await update.message.reply_text("⏳ Обрабатываю TXT...")
+    try:
+        file = await context.bot.get_file(doc.file_id)
+        file_path = f"/tmp/{doc.file_name}"
+        await file.download_to_drive(file_path)
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        os.remove(file_path)
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Ошибка обработки: {e}")
+        return
 
-        await update.message.reply_text(
-            f"📨 Рассылка на {len(self.phone_records)} номеров\n"
-            f"Выберите шаблон или введите свой текст:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+    phones = []
+    for line in lines:
+        line = line.strip()
+        cleaned = _clean_phone(line)
+        if cleaned and PHONE_RE.match(cleaned):
+            phones.append(cleaned)
 
-    # ─── Лог ───
+    if not phones:
+        await status_msg.edit_text("📭 Номеров не найдено в файле.")
+        return
 
-    async def show_log(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat.id != ADMIN_CHAT_ID:
-            return
+    await _save_phones(update, status_msg, phones, doc.file_name)
 
-        if not self.sent_log:
-            await update.message.reply_text("📊 Лог пуст")
-            return
 
-        lines = ["📊 **Последние отправки:**\n"]
-        for entry in self.sent_log[-20:]:
-            status = "✅" if entry["success"] else "❌"
-            lines.append(f"{status} {entry['phone']} — {entry.get('error', 'OK')}")
+def _clean_phone(raw: str) -> str:
+    """Нормализовать номер телефона"""
+    cleaned = "".join(ch for ch in raw if ch.isdigit() or ch == "+")
+    if cleaned.startswith("+7"):
+        phone = cleaned[:12]
+    elif cleaned.startswith("8") and len(cleaned) == 11:
+        phone = "+7" + cleaned[1:]
+    elif cleaned.startswith("7") and len(cleaned) == 11:
+        phone = "+7" + cleaned[1:]
+    else:
+        phone = cleaned
+    return phone
 
-        lines.append(f"\nВсего сегодня: {self.daily_sent_count}")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-    # ─── Callbacks ───
+async def _save_phones(update, status_msg, phones: list, file_name: str):
+    """Сохранить номера в базу и уведомить"""
+    user = update.message.from_user
+    username = user.username or ""
+    first_name = user.first_name or ""
 
-    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-
-        if query.message.chat_id != ADMIN_CHAT_ID:
-            return
-
-        data = query.data
-
-        # Выбор номера для одиночной отправки
-        if data.startswith("pick_"):
-            phone = data[5:]
-            self.selected_phone = phone
-
-            # Предлагаем шаблон
-            keyboard = []
-            for key in self.custom_templates:
-                keyboard.append([InlineKeyboardButton(
-                    f"📝 {key}", callback_data=f"tpl_{key}"
-                )])
-            keyboard.append([InlineKeyboardButton(
-                "✏️ Свой текст", callback_data="tpl_custom"
-            )])
-
-            await query.edit_message_text(
-                f"📱 Номер: `{phone}`\nВыберите шаблон или введите текст:",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
-
-        # Выбор шаблона для одиночной отправки
-        elif data.startswith("tpl_"):
-            tpl_name = data[4:]
-
-            if tpl_name == "custom":
-                self.user_mode[ADMIN_CHAT_ID] = "custom_text"
-                await query.edit_message_text(
-                    f"✏️ Введите текст сообщения для {self.selected_phone}:"
-                )
-            else:
-                message_text = self.custom_templates.get(tpl_name, "")
-                if message_text and self.selected_phone:
-                    await query.edit_message_text(f"⏳ Отправка на {self.selected_phone}...")
-                    await self._do_send(query.message, self.selected_phone, message_text)
-                    self.selected_phone = None
-
-        # Выбор шаблона для массовой рассылки
-        elif data.startswith("bulktpl_"):
-            tpl_name = data[8:]
-
-            if tpl_name == "custom":
-                self.user_mode[ADMIN_CHAT_ID] = "bulk_custom_text"
-                await query.edit_message_text("✏️ Введите текст для массовой рассылки:")
-            else:
-                message_text = self.custom_templates.get(tpl_name, "")
-                if message_text:
-                    await self._do_bulk_send(query.message, message_text)
-
-    # ─── Обработка сообщений ───
-
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat_id = update.effective_chat.id
-        if chat_id != ADMIN_CHAT_ID:
-            return
-
-        # PDF
-        if update.message.document and update.message.document.mime_type == "application/pdf":
-            await self.process_pdf(update, context)
-            return
-
-        if not update.message.text:
-            return
-
-        text = update.message.text
-        mode = self.user_mode.get(chat_id)
-
-        # Ручной ввод номера+текста
-        if mode == "manual_input":
-            self.user_mode.pop(chat_id, None)
-            await self._handle_manual_input(update, text)
-            return
-
-        # Свой текст для одиночной отправки
-        if mode == "custom_text" and self.selected_phone:
-            self.user_mode.pop(chat_id, None)
-            await update.message.reply_text(f"⏳ Отправка на {self.selected_phone}...")
-            await self._do_send(update.message, self.selected_phone, text)
-            self.selected_phone = None
-            return
-
-        # Свой текст для массовой рассылки
-        if mode == "bulk_custom_text":
-            self.user_mode.pop(chat_id, None)
-            await self._do_bulk_send(update.message, text)
-            return
-
-    async def _handle_manual_input(self, update: Update, text: str):
-        parts = text.split(' ', 1)
-        if len(parts) < 2:
-            await update.message.reply_text("❌ Формат: `+79XXXXXXXXX текст`", parse_mode="Markdown")
-            return
-
-        phone = parts[0].strip()
-        message = parts[1].strip()
-
-        if not re.match(r'\+?7\d{10}$', phone.replace('+', '+')):
-            await update.message.reply_text("❌ Неверный формат номера")
-            return
-
-        # Если ссылка на шаблон
-        if message.startswith('#'):
-            tpl_name = message[1:]
-            if tpl_name in self.custom_templates:
-                message = self.custom_templates[tpl_name]
-            else:
-                await update.message.reply_text(f"❌ Шаблон `{tpl_name}` не найден", parse_mode="Markdown")
-                return
-
-        await update.message.reply_text(f"⏳ Отправка на {phone}...")
-        await self._do_send(update.message, phone, message)
-
-    async def _do_send(self, message, phone: str, text: str):
-        """Отправить одно сообщение"""
-        if self.daily_sent_count >= 40:
-            await message.reply_text("⚠️ Достигнут лимит 40 сообщений в день!")
-            return
-
-        result = WhatsAppSender.send_message(phone, text)
-
-        log_entry = {
-            "phone": phone,
-            "success": result.get("success", False),
-            "error": result.get("error", "")
-        }
-        self.sent_log.append(log_entry)
-
-        if result.get("success"):
-            self.daily_sent_count += 1
-            await message.reply_text(
-                f"✅ Отправлено на {phone}\n"
-                f"📊 Отправок сегодня: {self.daily_sent_count}/40"
-            )
+    added = 0
+    skipped = 0
+    for phone in phones:
+        rec = PhoneRecord(phone, file_name, username, first_name)
+        if db.add_record(rec):
+            added += 1
         else:
-            error = result.get("error", "Неизвестная ошибка")
+            skipped += 1
 
-            if "не подключён" in error or "bridge_offline" in result.get("status", ""):
-                await message.reply_text(
-                    f"❌ WhatsApp не подключён!\n"
-                    f"Используйте /wapair для привязки"
-                )
-            else:
-                await message.reply_text(f"❌ Ошибка: {error}")
+    preview = "\n".join(f"• {p}" for p in phones[:5])
+    more = f"\n_...и ещё {len(phones) - 5}_" if len(phones) > 5 else ""
 
-    async def _do_bulk_send(self, message, text: str):
-        """Массовая рассылка"""
-        phones = [r.phone for r in self.phone_records]
-        remaining = 40 - self.daily_sent_count
+    text = (
+        f"✅ *Обработан файл:* `{file_name}`\n\n"
+        f"📞 Найдено: {len(phones)}\n"
+        f"➕ Добавлено новых: {added}\n"
+        f"⏭ Уже в базе: {skipped}\n\n"
+        f"{preview}{more}"
+    )
 
-        if remaining <= 0:
-            await message.reply_text("⚠️ Лимит 40 сообщений в день исчерпан!")
-            return
+    # Уведомить отправителя
+    await status_msg.edit_text(text, parse_mode="Markdown")
 
-        if len(phones) > remaining:
-            phones = phones[:remaining]
-            await message.reply_text(
-                f"⚠️ Из-за лимита будет отправлено только {remaining} из {len(self.phone_records)}"
-            )
-
-        result = WhatsAppSender.send_bulk(phones, text, delay=30)
-
-        if result.get("success"):
-            self.daily_sent_count += len(phones)
-            await message.reply_text(
-                f"📨 {result.get('message', 'Рассылка запущена')}\n"
-                f"⏱ {result.get('estimated_time', '')}\n\n"
-                f"Сообщения отправляются в фоне с интервалом 30-40 сек для безопасности."
-            )
-        else:
-            await message.reply_text(f"❌ Ошибка: {result.get('error')}")
-
-    async def process_pdf(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        document = update.message.document
-        file_name = document.file_name
-
-        file = await context.bot.get_file(document.file_id)
-        temp_path = f"/tmp/{file_name}"
-        await file.download_to_drive(temp_path)
-
+    # Если это не админ — уведомить админа
+    if update.effective_chat.id != ADMIN_CHAT_ID:
         try:
-            phones = extract_phones_from_pdf(temp_path)
-
-            if not phones:
-                await update.message.reply_text("⚠️ В PDF не найдено номеров.")
-            else:
-                added = 0
-                existing_phones = {r.phone for r in self.phone_records}
-
-                for phone in phones:
-                    if phone not in existing_phones:
-                        record = PhoneRecord(
-                            phone, file_name,
-                            update.message.from_user.username or "unknown",
-                            update.message.from_user.first_name or "unknown"
-                        )
-                        self.phone_records.append(record)
-                        added += 1
-
-                await update.message.reply_text(
-                    f"✅ Найдено {len(phones)} номеров, добавлено {added} новых\n"
-                    f"📋 Всего в списке: {len(self.phone_records)}\n\n"
-                    f"Используйте /send или /sendall"
-                )
+            admin_text = (
+                f"📥 *Новый файл от пользователя*\n"
+                f"👤 {first_name} (@{username})\n"
+                f"📄 `{file_name}`\n"
+                f"📞 Найдено: {len(phones)} | Новых: {added}"
+            )
+            await update.get_bot().send_message(
+                ADMIN_CHAT_ID,
+                admin_text,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("📊 Открыть меню", callback_data="admin_menu")]]
+                ),
+            )
         except Exception as e:
-            logger.error(f"Ошибка PDF: {e}")
-            await update.message.reply_text(f"❌ Ошибка: {e}")
-        finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+            logger.warning(f"Не удалось уведомить админа: {e}")
 
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка текстовых сообщений"""
+    text = update.message.text.strip()
+    state = context.user_data.get("state")
+
+    # ── Состояния (FSM) ──────────────────────────────────────────────────────
+
+    if state == "awaiting_broadcast_text":
+        if not is_admin(update):
+            return
+        db.set_broadcast_text(text)
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ Текст рассылки сохранён:\n\n_{text}_",
+            parse_mode="Markdown",
+            reply_markup=admin_main_keyboard(),
+        )
+        return
+
+    if state == "awaiting_manual_phone":
+        if not is_admin(update):
+            return
+        phone = _clean_phone(text)
+        if not PHONE_RE.match(phone):
+            await update.message.reply_text(
+                "❌ Неверный формат. Введите номер в виде +79XXXXXXXXX или 89XXXXXXXXX:",
+                reply_markup=back_keyboard("admin_menu"),
+            )
+            return
+        added = db.add_phone_manual(phone, added_by=update.effective_user.username or "admin")
+        context.user_data.clear()
+        if added:
+            await update.message.reply_text(
+                f"✅ Номер `{phone}` добавлен в базу.",
+                parse_mode="Markdown",
+                reply_markup=admin_main_keyboard(),
+            )
+        else:
+            await update.message.reply_text(
+                f"⚠️ Номер `{phone}` уже есть в базе.",
+                parse_mode="Markdown",
+                reply_markup=admin_main_keyboard(),
+            )
+        return
+
+    if state == "awaiting_delete_phone":
+        if not is_admin(update):
+            return
+        phone = _clean_phone(text)
+        deleted = db.delete_phone(phone)
+        context.user_data.clear()
+        msg = f"✅ Номер `{phone}` удалён." if deleted else f"❌ Номер `{phone}` не найден."
+        await update.message.reply_text(
+            msg, parse_mode="Markdown", reply_markup=admin_main_keyboard()
+        )
+        return
+
+    if state == "awaiting_single_phone_send":
+        if not is_admin(update):
+            return
+        # Формат: "+79001234567 Текст сообщения"
+        parts = text.split(None, 1)
+        if len(parts) < 2:
+            await update.message.reply_text(
+                "❌ Введите: `+79001234567 Текст сообщения`",
+                parse_mode="Markdown",
+            )
+            return
+        phone = _clean_phone(parts[0])
+        msg_text = parts[1]
+        if not PHONE_RE.match(phone):
+            await update.message.reply_text("❌ Неверный формат номера.")
+            return
+        context.user_data.clear()
+        status = WhatsAppSender.get_status()
+        if not status.get("connected"):
+            await update.message.reply_text(
+                "❌ WhatsApp не подключён. Используйте кнопку *Пара WA*.",
+                parse_mode="Markdown",
+                reply_markup=admin_main_keyboard(),
+            )
+            return
+        result = WhatsAppSender.send_message(phone, msg_text)
+        if result.get("success"):
+            await update.message.reply_text(
+                f"✅ Сообщение отправлено на `{phone}`",
+                parse_mode="Markdown",
+                reply_markup=admin_main_keyboard(),
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ Ошибка: {result.get('error')}",
+                reply_markup=admin_main_keyboard(),
+            )
+        return
+
+    # ── Попытка распознать номер телефона из текста ────────────────────────
+
+    phone = _clean_phone(text)
+    if PHONE_RE.match(phone):
+        user = update.message.from_user
+        rec = PhoneRecord(phone, "direct_message", user.username or "", user.first_name or "")
+        added = db.add_record(rec)
+
+        if added:
+            reply = f"✅ Номер `{phone}` сохранён!"
+        else:
+            reply = f"ℹ️ Номер `{phone}` уже есть в базе."
+
+        await update.message.reply_text(reply, parse_mode="Markdown")
+
+        # Уведомить админа
+        if update.effective_chat.id != ADMIN_CHAT_ID:
+            try:
+                await update.get_bot().send_message(
+                    ADMIN_CHAT_ID,
+                    f"📞 Новый номер от {user.first_name} (@{user.username or '?'}): `{phone}`",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+        return
+
+    # ── Иначе — подсказка ──────────────────────────────────────────────────
+
+    if is_admin(update):
+        await update.message.reply_text(
+            "Используйте кнопки меню 👇",
+            reply_markup=admin_main_keyboard(),
+        )
+    else:
+        await update.message.reply_text(
+            "Отправьте PDF-файл или номер телефона (+79XXXXXXXXX).",
+            reply_markup=user_main_keyboard(),
+        )
+
+
+# ─────────────────────────── Callback Query ────────────────────────────────────
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    # Только админ управляет
+    if not is_admin(update) and data not in ("hint_pdf", "about"):
+        await query.edit_message_text("⛔ Только для администратора.")
+        return
+
+    # ── Главное меню ────────────────────────────────────────────────────────
+
+    if data == "admin_menu":
+        context.user_data.clear()
+        await query.edit_message_text(
+            "👑 *Панель администратора*\n\nВыберите действие:",
+            parse_mode="Markdown",
+            reply_markup=admin_main_keyboard(),
+        )
+
+    # ── Статистика ──────────────────────────────────────────────────────────
+
+    elif data == "stats":
+        stats = db.get_stats()
+        text = (
+            f"📊 *Статистика базы*\n\n"
+            f"📞 Всего номеров: {stats['total']}\n"
+            f"✅ Отправлено: {stats['sent']}\n"
+            f"⏳ Не отправлено: {stats['unsent']}\n"
+            f"📝 Текст рассылки: {'✅ задан' if db.broadcast_text else '❌ не задан'}"
+        )
+        await query.edit_message_text(
+            text, parse_mode="Markdown", reply_markup=back_keyboard("admin_menu")
+        )
+
+    # ── Текст рассылки ──────────────────────────────────────────────────────
+
+    elif data == "set_text":
+        context.user_data["state"] = "awaiting_broadcast_text"
+        current = f"\n\nТекущий текст:\n_{db.broadcast_text}_" if db.broadcast_text else ""
+        await query.edit_message_text(
+            f"✏️ *Установка текста рассылки*{current}\n\n"
+            "Напишите новый текст сообщения для рассылки:",
+            parse_mode="Markdown",
+            reply_markup=back_keyboard("admin_menu"),
+        )
+
+    elif data == "show_text":
+        if db.broadcast_text:
+            text = f"📝 *Текущий текст рассылки:*\n\n{db.broadcast_text}"
+        else:
+            text = "❌ Текст рассылки не задан.\nНажмите *Текст рассылки* чтобы установить."
+        await query.edit_message_text(
+            text, parse_mode="Markdown", reply_markup=back_keyboard("admin_menu")
+        )
+
+    # ── Рассылка новым (unsent) ─────────────────────────────────────────────
+
+    elif data == "broadcast_unsent":
+        phones = db.get_unsent_phones()
+        if not phones:
+            await query.edit_message_text(
+                "✅ Все номера уже получили рассылку!\n\n"
+                "Нажмите *Сбросить статусы* в списке номеров, чтобы разослать повторно.",
+                parse_mode="Markdown",
+                reply_markup=back_keyboard("admin_menu"),
+            )
+            return
+        if not db.broadcast_text:
+            await query.edit_message_text(
+                "❌ Текст рассылки не задан!\n"
+                "Сначала нажмите *Текст рассылки* и установите текст.",
+                parse_mode="Markdown",
+                reply_markup=back_keyboard("admin_menu"),
+            )
+            return
+        buttons = [
+            [
+                InlineKeyboardButton(
+                    f"✅ Да, разослать {len(phones)} номерам",
+                    callback_data="confirm_broadcast_unsent",
+                )
+            ],
+            [InlineKeyboardButton("❌ Отмена", callback_data="admin_menu")],
+        ]
+        preview = db.broadcast_text[:200] + ("..." if len(db.broadcast_text) > 200 else "")
+        await query.edit_message_text(
+            f"📨 *Рассылка новым номерам*\n\n"
+            f"Получателей: *{len(phones)}*\n\n"
+            f"Текст:\n_{preview}_\n\n"
+            "Подтвердить?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif data == "confirm_broadcast_unsent":
+        phones = db.get_unsent_phones()
+        await _do_broadcast(query, context, phones, mark_sent=True)
+
+    # ── Рассылка всем ────────────────────────────────────────────────────────
+
+    elif data == "broadcast_all":
+        phones = db.get_all_phones()
+        if not phones:
+            await query.edit_message_text(
+                "❌ База номеров пуста.",
+                reply_markup=back_keyboard("admin_menu"),
+            )
+            return
+        if not db.broadcast_text:
+            await query.edit_message_text(
+                "❌ Текст рассылки не задан!",
+                reply_markup=back_keyboard("admin_menu"),
+            )
+            return
+        buttons = [
+            [
+                InlineKeyboardButton(
+                    f"✅ Да, разослать всем {len(phones)}",
+                    callback_data="confirm_broadcast_all",
+                )
+            ],
+            [InlineKeyboardButton("❌ Отмена", callback_data="admin_menu")],
+        ]
+        preview = db.broadcast_text[:200] + ("..." if len(db.broadcast_text) > 200 else "")
+        await query.edit_message_text(
+            f"📢 *Рассылка ВСЕМ номерам*\n\n"
+            f"Получателей: *{len(phones)}*\n\n"
+            f"Текст:\n_{preview}_\n\n"
+            "Подтвердить?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif data == "confirm_broadcast_all":
+        phones = db.get_all_phones()
+        await _do_broadcast(query, context, phones, mark_sent=True)
+
+    # ── Список номеров ──────────────────────────────────────────────────────
+
+    elif data.startswith("list_phones:"):
+        page = int(data.split(":")[1])
+        records, total_pages = db.get_records_page(page)
+
+        if not records:
+            await query.edit_message_text(
+                "📭 База номеров пуста.",
+                reply_markup=admin_main_keyboard(),
+            )
+            return
+
+        lines = [f"📋 *Список номеров* (стр. {page + 1}/{total_pages})\n"]
+        for i, r in enumerate(records, start=page * 10 + 1):
+            status_icon = "✅" if r.sent else "⏳"
+            ts = r.timestamp.strftime("%d.%m %H:%M")
+            lines.append(
+                f"{i}. {status_icon} `{r.phone}`\n"
+                f"   📄 {r.file_name} | 👤 @{r.sender_username or '?'} | 🕐 {ts}"
+            )
+
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=phones_list_keyboard(page, total_pages),
+        )
+
+    # ── Добавление номера ────────────────────────────────────────────────────
+
+    elif data == "add_phone":
+        context.user_data["state"] = "awaiting_manual_phone"
+        await query.edit_message_text(
+            "➕ *Добавление номера*\n\n"
+            "Введите номер телефона:\n"
+            "Форматы: `+79001234567` или `89001234567`",
+            parse_mode="Markdown",
+            reply_markup=back_keyboard("admin_menu"),
+        )
+
+    # ── Удаление номера ──────────────────────────────────────────────────────
+
+    elif data == "delete_phone_prompt":
+        context.user_data["state"] = "awaiting_delete_phone"
+        await query.edit_message_text(
+            "❌ *Удаление номера*\n\n"
+            "Введите номер для удаления:",
+            parse_mode="Markdown",
+            reply_markup=back_keyboard("list_phones:0"),
+        )
+
+    # ── Сброс статусов ───────────────────────────────────────────────────────
+
+    elif data == "reset_sent":
+        all_phones = db.get_all_phones()
+        db.mark_unsent(all_phones)
+        await query.edit_message_text(
+            f"🔄 Статусы сброшены для {len(all_phones)} номеров.\n"
+            "Теперь все они считаются не отправленными.",
+            reply_markup=back_keyboard("list_phones:0"),
+        )
+
+    # ── Очистка базы ─────────────────────────────────────────────────────────
+
+    elif data == "clear_confirm":
+        stats = db.get_stats()
+        buttons = [
+            [
+                InlineKeyboardButton(
+                    f"🗑 Да, удалить все {stats['total']} номеров",
+                    callback_data="clear_execute",
+                )
+            ],
+            [InlineKeyboardButton("❌ Отмена", callback_data="admin_menu")],
+        ]
+        await query.edit_message_text(
+            f"⚠️ *Очистка базы*\n\nБудет удалено {stats['total']} номеров.\nЭто необратимо!",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif data == "clear_execute":
+        db.clear_all()
+        await query.edit_message_text(
+            "✅ База очищена.",
+            reply_markup=admin_main_keyboard(),
+        )
+
+    # ── WhatsApp ─────────────────────────────────────────────────────────────
+
+    elif data == "wa_status":
+        status = WhatsAppSender.get_status()
+        if status.get("connected"):
+            text = f"✅ *WhatsApp подключён*\nСтатус: `{status.get('status')}`"
+        else:
+            text = (
+                f"❌ *WhatsApp НЕ подключён*\n"
+                f"Статус: `{status.get('status', 'unknown')}`\n\n"
+                "Нажмите *Пара WA* для подключения."
+            )
+        buttons = [
+            [InlineKeyboardButton("🔄 Обновить", callback_data="wa_status")],
+            [InlineKeyboardButton("◀️ Назад", callback_data="admin_menu")],
+        ]
+        await query.edit_message_text(
+            text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    elif data == "wa_pair":
+        await query.edit_message_text("🔄 Запрашиваю код пары...")
+        result = WhatsAppSender.pair()
+        if result.get("success"):
+            code = result.get("code")
+            text = (
+                f"📱 *Код пары WhatsApp:*\n\n"
+                f"`{code}`\n\n"
+                "Введите этот код в WhatsApp:\n"
+                "Настройки → Связанные устройства → Привязать устройство → Введите код"
+            )
+        else:
+            text = f"❌ Ошибка: {result.get('error')}"
+        await query.edit_message_text(
+            text, parse_mode="Markdown", reply_markup=back_keyboard("admin_menu")
+        )
+
+    elif data == "wa_logout":
+        buttons = [
+            [InlineKeyboardButton("✅ Да, выйти", callback_data="wa_logout_confirm")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="admin_menu")],
+        ]
+        await query.edit_message_text(
+            "⚠️ Выйти из WhatsApp?",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif data == "wa_logout_confirm":
+        result = WhatsAppSender.logout()
+        if result.get("success"):
+            text = "👋 Выполнен выход из WhatsApp."
+        else:
+            text = f"❌ Ошибка: {result.get('error')}"
+        await query.edit_message_text(text, reply_markup=back_keyboard("admin_menu"))
+
+    # ── Отправка одному номеру ────────────────────────────────────────────────
+
+    elif data == "send_single":
+        context.user_data["state"] = "awaiting_single_phone_send"
+        await query.edit_message_text(
+            "📤 *Отправка одному номеру*\n\n"
+            "Напишите в формате:\n`+79001234567 Текст сообщения`",
+            parse_mode="Markdown",
+            reply_markup=back_keyboard("admin_menu"),
+        )
+
+    # ── Для обычных пользователей ─────────────────────────────────────────────
+
+    elif data == "hint_pdf":
+        await query.edit_message_text(
+            "📄 Просто перетащите PDF-файл в чат!\n"
+            "Бот автоматически извлечёт из него номер телефона.",
+            reply_markup=user_main_keyboard(),
+        )
+
+    elif data == "about":
+        await query.edit_message_text(
+            "ℹ️ *О боте*\n\n"
+            "Бот собирает номера телефонов из PDF-файлов и текстовых сообщений.\n"
+            "Отправьте PDF — и номер будет сохранён.",
+            parse_mode="Markdown",
+            reply_markup=user_main_keyboard(),
+        )
+
+    elif data == "noop":
+        pass  # Кнопка текущей страницы, ничего не делаем
+
+
+# ─────────────────────────── Внутренняя рассылка ──────────────────────────────
+
+async def _do_broadcast(query, context, phones: list, mark_sent: bool = True):
+    """Выполнить рассылку по списку номеров"""
+    if not phones:
+        await query.edit_message_text(
+            "❌ Нет номеров для рассылки.",
+            reply_markup=back_keyboard("admin_menu"),
+        )
+        return
+
+    status = WhatsAppSender.get_status()
+    if not status.get("connected"):
+        await query.edit_message_text(
+            "❌ WhatsApp не подключён!\n"
+            "Нажмите *Пара WA* для подключения.",
+            parse_mode="Markdown",
+            reply_markup=back_keyboard("admin_menu"),
+        )
+        return
+
+    await query.edit_message_text(
+        f"⏳ Начинаю рассылку на {len(phones)} номеров...\n"
+        "Это может занять некоторое время."
+    )
+
+    result = WhatsAppSender.send_bulk(phones, db.broadcast_text)
+
+    if result.get("success"):
+        sent = result.get("sent", 0)
+        total = result.get("total", len(phones))
+        errors = result.get("errors", [])
+
+        if mark_sent:
+            # Пометить успешно отправленные
+            sent_phones = [p for p in phones if p not in {e["phone"] for e in errors}]
+            db.mark_sent(sent_phones)
+
+        error_text = ""
+        if errors:
+            error_lines = [f"• `{e['phone']}`: {e['error']}" for e in errors[:5]]
+            error_text = f"\n\n❌ Ошибки ({len(errors)}):\n" + "\n".join(error_lines)
+            if len(errors) > 5:
+                error_text += f"\n_...и ещё {len(errors) - 5} ошибок_"
+
+        await query.edit_message_text(
+            f"✅ *Рассылка завершена*\n\n"
+            f"📤 Отправлено: {sent}/{total}{error_text}",
+            parse_mode="Markdown",
+            reply_markup=admin_main_keyboard(),
+        )
+    else:
+        await query.edit_message_text(
+            f"❌ Ошибка рассылки: {result.get('error')}",
+            reply_markup=back_keyboard("admin_menu"),
+        )
+
+
+# ─────────────────────────── Запуск ────────────────────────────────────────────
 
 def main():
-    # Проверяем WA Bridge
-    try:
-        WhatsAppSender.init()
-    except Exception as e:
-        logger.warning(f"⚠️ WA Bridge недоступен: {e}")
-        logger.warning("Бот запустится без WhatsApp. Привяжите через /wapair")
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    bot = ProfileBot()
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Команды
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu_command))
 
-    application.add_handler(CommandHandler("start", bot.start))
-    application.add_handler(CommandHandler("numbers", bot.numbers))
-    application.add_handler(CommandHandler("send", bot.send_command))
-    application.add_handler(CommandHandler("sendall", bot.send_all))
-    application.add_handler(CommandHandler("sendmanual", bot.send_manual))
-    application.add_handler(CommandHandler("templates", bot.templates))
-    application.add_handler(CommandHandler("addtemplate", bot.add_template))
-    application.add_handler(CommandHandler("wastatus", bot.wa_status))
-    application.add_handler(CommandHandler("wapair", bot.wa_pair))
-    application.add_handler(CommandHandler("walogout", bot.wa_logout))
-    application.add_handler(CommandHandler("clear", bot.clear))
-    application.add_handler(CommandHandler("log", bot.show_log))
-    application.add_handler(CallbackQueryHandler(bot.handle_callback))
-    application.add_handler(MessageHandler(filters.ALL, bot.handle_message))
+    # Файлы (от любого пользователя)
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    logger.info("✅ Бот запущен!")
-    application.run_polling()
+    # Текстовые сообщения
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+
+    # Кнопки
+    app.add_handler(CallbackQueryHandler(callback_handler))
+
+    logger.info("Бот запущен")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
